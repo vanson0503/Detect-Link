@@ -90,32 +90,35 @@ class VideoDetector:
         is_youtube = 'youtube.com' in parsed.netloc or 'youtu.be' in parsed.netloc
         
         if is_youtube:
-            # Strategy:
-            # - With cookies + node.js: use 'web' client (full quality, authenticated)
-            # - Without cookies: use 'android_vr' (no PO Token, no JS runtime needed)
-            # NOTE: android_vr and ios clients do NOT support cookies (yt-dlp skips them)
-            if cookies_file and js_runtimes:
-                youtube_player_clients = ["web", "android_vr"]
-                logger.info("YouTube cookies + Node.js available, using web client")
-            elif cookies_file:
-                # cookies but no JS runtime - web won't solve n-challenge well, try anyway
-                youtube_player_clients = ["web", "android_vr"]
-                logger.info("YouTube cookies available (no JS runtime), trying web client")
-            else:
-                youtube_player_clients = ["android_vr", "android"]
-                logger.info("No YouTube cookies, using android_vr client (no PO Token needed)")
+            # Strategy (order matters):
+            # 1. android_vr first → no cookies, no JS, no PO Token needed → fast, works for most public videos
+            # 2. web with cookies → for age-restricted / sign-in required videos (needs valid cookies + node.js)
+            # NOTE: cookies are ONLY passed to web client. android_vr doesn't support cookies (yt-dlp skips them)
             
-            for client in youtube_player_clients:
-                ydl_opts = dict(base_opts)
+            # Base opts WITHOUT cookies for android_vr
+            base_opts_no_cookies = {k: v for k, v in base_opts.items() if k != 'cookiefile'}
+            
+            clients_config = [
+                # (client_name, opts_to_use, description)
+                ("android_vr", base_opts_no_cookies, "android_vr (no cookies, public videos)"),
+            ]
+            
+            # Add web client with cookies as fallback if cookies are available
+            if cookies_file:
+                clients_config.append(("web", base_opts, "web (with cookies, restricted videos)"))
+            
+            for client, opts, desc in clients_config:
+                ydl_opts = dict(opts)
                 ydl_opts['extractor_args'] = {
                     'youtube': {
                         'player_client': [client],
                     },
                 }
+                logger.info(f"Trying YouTube client: {desc}")
                 try:
                     info = await loop.run_in_executor(
                         None,
-                        lambda opts=ydl_opts: yt_dlp.YoutubeDL(opts).extract_info(url, download=False)
+                        lambda o=ydl_opts: yt_dlp.YoutubeDL(o).extract_info(url, download=False)
                     )
                     if info:
                         _formats = info.get("formats", [])
