@@ -37,7 +37,7 @@ if __name__ == "__main__":
 
     # Support PORT env var for cloud deployments (Fly.io, Render, Railway)
     port = int(os.environ.get("PORT", 8000))
-    host = os.environ.get("HOST", "0.0.0.0")
+    host = os.environ.get("HOST", "127.0.0.1")
 
     print(f"[*] Starting FastAPI Web Server at http://{host}:{port} ...")
     uvicorn.run(

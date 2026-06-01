@@ -43,28 +43,89 @@ def get_stream_type_from_url_or_content_type(url: str, content_type: str = "") -
 class VideoDetector:
     @staticmethod
     async def _detect_yt_dlp(url: str, ua: str, custom_headers: Dict[str, str] = None) -> Tuple[str, List[DetectedVideo]]:
-        import yt_dlp
+        import os
         
-        ydl_opts = {
+        base_opts = {
             'quiet': True,
             'skip_download': True,
             'user_agent': ua,
             'noplaylist': True,
-            'extractor_args': {'generic': {'impersonate': ['chrome']}},
         }
         
         if custom_headers:
-            ydl_opts['http_headers'] = custom_headers
+            base_opts['http_headers'] = custom_headers
+        
+        # Support YouTube cookies file to bypass bot detection on server/VPS
+        # Set YOUTUBE_COOKIES_FILE=/path/to/cookies.txt on the server
+        cookies_file = os.environ.get("YOUTUBE_COOKIES_FILE", "")
+        if not cookies_file:
+            # Auto-detect cookies.txt in app directory
+            default_cookies = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cookies.txt")
+            if os.path.isfile(default_cookies):
+                cookies_file = default_cookies
+        if cookies_file:
+            base_opts['cookiefile'] = cookies_file
+            logger.info(f"Using YouTube cookies file: {cookies_file}")
+        
+        # Use Node.js as JS runtime if available (set via YT_DLP_JS_RUNTIMES env var)
+        js_runtimes = os.environ.get("YT_DLP_JS_RUNTIMES", "")
+        if js_runtimes:
+            base_opts['js_runtimes'] = js_runtimes
         
         loop = asyncio.get_event_loop()
-        try:
-            info = await loop.run_in_executor(
-                None,
-                lambda: yt_dlp.YoutubeDL(ydl_opts).extract_info(url, download=False)
-            )
-        except Exception as e:
-            logger.info(f"yt-dlp extraction failed or unsupported: {str(e)}")
-            return "", []
+        info = None
+        
+        parsed = urlparse(url)
+        is_youtube = 'youtube.com' in parsed.netloc or 'youtu.be' in parsed.netloc
+        
+        if is_youtube:
+            # android_vr: no PO Token needed, no JS runtime needed → best for servers
+            # If cookies are available, try web client first (best quality + auth)
+            if cookies_file:
+                youtube_player_clients = ["web", "android_vr", "android"]
+                logger.info("YouTube cookies available, trying web client first")
+            else:
+                youtube_player_clients = ["android_vr", "android"]
+                logger.info("No YouTube cookies, using android_vr client (no PO Token needed)")
+            
+            for client in youtube_player_clients:
+                ydl_opts = dict(base_opts)
+                ydl_opts['extractor_args'] = {
+                    'youtube': {
+                        'player_client': [client],
+                    },
+                }
+                try:
+                    info = await loop.run_in_executor(
+                        None,
+                        lambda opts=ydl_opts: yt_dlp.YoutubeDL(opts).extract_info(url, download=False)
+                    )
+                    if info:
+                        _formats = info.get("formats", [])
+                        if not _formats and info.get("url"):
+                            _formats = [info]
+                        # Filter out mhtml (storyboard) formats - only count real video/audio
+                        real_formats = [f for f in _formats if f.get("ext") not in ("mhtml",) and f.get("url")]
+                        if real_formats:
+                            logger.info(f"yt-dlp succeeded with player_client={client}, {len(real_formats)} formats")
+                            break
+                        else:
+                            logger.info(f"yt-dlp client={client} returned no real formats, trying next...")
+                            info = None
+                except Exception as e:
+                    logger.info(f"yt-dlp extraction failed with client={client}: {str(e)}")
+                    info = None
+        else:
+            # Non-YouTube: use generic with impersonation
+            ydl_opts = dict(base_opts)
+            ydl_opts['extractor_args'] = {'generic': {'impersonate': ['chrome']}}
+            try:
+                info = await loop.run_in_executor(
+                    None,
+                    lambda: yt_dlp.YoutubeDL(ydl_opts).extract_info(url, download=False)
+                )
+            except Exception as e:
+                logger.info(f"yt-dlp extraction failed or unsupported: {str(e)}")
             
         if not info:
             return "", []
