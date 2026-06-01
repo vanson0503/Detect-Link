@@ -44,6 +44,7 @@ class VideoDetector:
     @staticmethod
     async def _detect_yt_dlp(url: str, ua: str, custom_headers: Dict[str, str] = None) -> Tuple[str, List[DetectedVideo]]:
         import os
+        import yt_dlp
         
         base_opts = {
             'quiet': True,
@@ -59,16 +60,24 @@ class VideoDetector:
         # Set YOUTUBE_COOKIES_FILE=/path/to/cookies.txt on the server
         cookies_file = os.environ.get("YOUTUBE_COOKIES_FILE", "")
         if not cookies_file:
-            # Auto-detect cookies.txt in app directory
-            default_cookies = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cookies.txt")
+            # Auto-detect cookies.txt at project root (two levels up from app/services/)
+            default_cookies = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "cookies.txt")
             if os.path.isfile(default_cookies):
-                cookies_file = default_cookies
+                cookies_file = os.path.normpath(default_cookies)
         if cookies_file:
             base_opts['cookiefile'] = cookies_file
             logger.info(f"Using YouTube cookies file: {cookies_file}")
         
-        # Use Node.js as JS runtime if available (set via YT_DLP_JS_RUNTIMES env var)
-        js_runtimes = os.environ.get("YT_DLP_JS_RUNTIMES", "")
+        # Auto-detect Node.js for yt-dlp JS runtime (needed by web client for n-challenge)
+        # yt-dlp expects js_runtimes as a dict: {"node": {"path": "/path/to/node"}}
+        js_runtimes_env = os.environ.get("YT_DLP_JS_RUNTIMES", "")
+        js_runtimes = None
+        if not js_runtimes_env:
+            import shutil
+            node_path = shutil.which("node")
+            if node_path:
+                js_runtimes = {"node": {"path": node_path}}
+                logger.info(f"Auto-detected Node.js at: {node_path}")
         if js_runtimes:
             base_opts['js_runtimes'] = js_runtimes
         
@@ -79,11 +88,17 @@ class VideoDetector:
         is_youtube = 'youtube.com' in parsed.netloc or 'youtu.be' in parsed.netloc
         
         if is_youtube:
-            # android_vr: no PO Token needed, no JS runtime needed → best for servers
-            # If cookies are available, try web client first (best quality + auth)
-            if cookies_file:
-                youtube_player_clients = ["web", "android_vr", "android"]
-                logger.info("YouTube cookies available, trying web client first")
+            # Strategy:
+            # - With cookies + node.js: use 'web' client (full quality, authenticated)
+            # - Without cookies: use 'android_vr' (no PO Token, no JS runtime needed)
+            # NOTE: android_vr and ios clients do NOT support cookies (yt-dlp skips them)
+            if cookies_file and js_runtimes:
+                youtube_player_clients = ["web", "android_vr"]
+                logger.info("YouTube cookies + Node.js available, using web client")
+            elif cookies_file:
+                # cookies but no JS runtime - web won't solve n-challenge well, try anyway
+                youtube_player_clients = ["web", "android_vr"]
+                logger.info("YouTube cookies available (no JS runtime), trying web client")
             else:
                 youtube_player_clients = ["android_vr", "android"]
                 logger.info("No YouTube cookies, using android_vr client (no PO Token needed)")
