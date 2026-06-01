@@ -51,6 +51,8 @@ class VideoDetector:
             'skip_download': True,
             'user_agent': ua,
             'noplaylist': True,
+            # Allow yt-dlp to download EJS challenge solver from GitHub (needed for YouTube n-challenge)
+            'remote_components': ['ejs:github'],
         }
         
         if custom_headers:
