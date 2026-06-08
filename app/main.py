@@ -53,6 +53,15 @@ async def detect_video_links(payload: DetectRequest):
             custom_user_agent=payload.user_agent
         )
         
+        if not videos:
+            return DetectResponse(
+                success=False,
+                url=payload.url,
+                title=title or None,
+                videos=[],
+                error="No videos found."
+            )
+            
         return DetectResponse(
             success=True,
             url=payload.url,

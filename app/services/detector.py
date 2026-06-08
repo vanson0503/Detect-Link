@@ -2,11 +2,19 @@ import asyncio
 import logging
 import sys
 import subprocess
+import re
 from typing import List, Dict, Set, Tuple
 from urllib.parse import urljoin, urlparse
 from playwright.async_api import async_playwright
 from app.models.response import DetectedVideo
 from app.core.config import settings
+
+try:
+    from playwright_stealth import stealth_async
+except ImportError:
+    stealth_async = None
+import cloudscraper
+import streamlink
 
 logger = logging.getLogger(__name__)
 
@@ -338,6 +346,48 @@ class VideoDetector:
                 v.headers["Cookie"] = cookie_string
 
     @staticmethod
+    def _detect_fast_regex(url: str, ua: str, custom_headers: Dict[str, str] = None) -> Tuple[str, List[DetectedVideo]]:
+        try:
+            scraper = cloudscraper.create_scraper()
+            headers = {"User-Agent": ua}
+            if custom_headers:
+                headers.update(custom_headers)
+            
+            resp = scraper.get(url, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                html = resp.text
+                title = ""
+                title_match = re.search(r'<title[^>]*>([^<]+)</title>', html, re.IGNORECASE)
+                if title_match:
+                    title = title_match.group(1).strip()
+                
+                url_pattern = r'(https?://[^\s"\'<>]*?\.(?:m3u8|mp4|webm|dash)[^\s"\'<>]*)'
+                matches = re.findall(url_pattern, html, re.IGNORECASE)
+                
+                detected = []
+                seen = set()
+                for m in matches:
+                    if m in seen:
+                        continue
+                    seen.add(m)
+                    stream_type = get_stream_type_from_url_or_content_type(m)
+                    if stream_type != "unknown":
+                        detected.append(
+                            DetectedVideo(
+                                url=m,
+                                type=stream_type,
+                                headers={"User-Agent": ua, "Referer": url},
+                                thumbnail=None,
+                                has_audio=None,
+                                quality=None
+                            )
+                        )
+                return title, detected
+        except Exception as e:
+            logger.debug(f"Fast regex detect failed: {str(e)}")
+        return "", []
+
+    @staticmethod
     async def detect(
         url: str,
         timeout_ms: int = 15000,
@@ -373,7 +423,17 @@ class VideoDetector:
                     VideoDetector._inject_cookies(videos, cookies)
             return title, videos
             
-        # 3. Fallback to Playwright browser sniffing (naturally captures cookies via browser context)
+        # 3. Try fast regex with cloudscraper
+        logger.info(f"Trying fast regex scan for URL: {url}")
+        title, videos = await asyncio.get_event_loop().run_in_executor(
+            None, 
+            lambda: VideoDetector._detect_fast_regex(url, ua, custom_headers)
+        )
+        if videos:
+            logger.info(f"Fast regex successfully detected {len(videos)} video stream(s).")
+            return title, videos
+            
+        # 4. Fallback to Playwright browser sniffing (naturally captures cookies via browser context)
         logger.info(f"Falling back to Playwright browser sniffing for URL: {url}")
         return await VideoDetector._detect_playwright(
             url=url,
@@ -419,6 +479,9 @@ class VideoDetector:
                 
             context = await browser.new_context(**context_args)
             page = await context.new_page()
+            
+            if stealth_async:
+                await stealth_async(page)
 
             def add_video(video_url: str, stream_type: str, request_headers: Dict[str, str], poster: str = None, has_audio: bool = None):
                 if video_url in seen_urls:
@@ -484,11 +547,42 @@ class VideoDetector:
                                 actual_type = "mp4"
                                 
                         add_video(req_url, actual_type, req.headers)
+                    
+                    # Regex deep scan on response text if it's HTML or JSON
+                    if "text/html" in content_type or "application/json" in content_type:
+                        try:
+                            body = await response.text()
+                            url_pattern = r'(https?://[^\s"\'<>]*?\.(?:m3u8|mp4|webm|dash)[^\s"\'<>]*)'
+                            matches = re.findall(url_pattern, body, re.IGNORECASE)
+                            for m in matches:
+                                st = get_stream_type_from_url_or_content_type(m)
+                                if st != "unknown":
+                                    add_video(m, st, req.headers)
+                        except Exception:
+                            pass
                 except Exception as e:
                     logger.debug(f"Error handling response intercept: {str(e)}")
 
+            async def handle_websocket(ws):
+                try:
+                    def on_framereceived(frame):
+                        try:
+                            text = frame if isinstance(frame, str) else frame.decode('utf-8', errors='ignore')
+                            url_pattern = r'(https?://[^\s"\'<>]*?\.(?:m3u8|mp4|webm|dash)[^\s"\'<>]*)'
+                            matches = re.findall(url_pattern, text, re.IGNORECASE)
+                            for m in matches:
+                                st = get_stream_type_from_url_or_content_type(m)
+                                if st != "unknown":
+                                    add_video(m, st, {"User-Agent": ua, "Referer": url})
+                        except Exception:
+                            pass
+                    ws.on("framereceived", on_framereceived)
+                except Exception as e:
+                    logger.debug(f"Error handling websocket: {str(e)}")
+
             page.on("request", lambda r: asyncio.ensure_future(handle_request(r)))
             page.on("response", lambda r: asyncio.ensure_future(handle_response(r)))
+            page.on("websocket", handle_websocket)
 
             try:
                 # Go to page
@@ -497,44 +591,49 @@ class VideoDetector:
                 # Fetch page title
                 page_title = await page.title()
                 
-                # Try to trigger auto-play or source discovery on video elements
-                video_elements = await page.query_selector_all("video")
-                for element in video_elements:
-                    poster = None
+                # Try to trigger auto-play or source discovery on video elements across all frames
+                frames = page.frames
+                for frame in frames:
                     try:
-                        poster_attr = await element.get_attribute("poster")
-                        if poster_attr:
-                            poster = urljoin(url, poster_attr)
-                    except Exception:
-                        pass
+                        video_elements = await frame.query_selector_all("video")
+                        for element in video_elements:
+                            poster = None
+                            try:
+                                poster_attr = await element.get_attribute("poster")
+                                if poster_attr:
+                                    poster = urljoin(url, poster_attr)
+                            except Exception:
+                                pass
 
-                    try:
-                        # Attempt to click or play the video element programmatically
-                        await page.evaluate("(elem) => { elem.play().catch(err => {}); }", element)
-                    except Exception:
-                        pass
-                    
-                    try:
-                        src = await element.get_attribute("src")
-                        if src and not src.startswith("blob:"):
-                            absolute_src = urljoin(url, src)
-                            t = get_stream_type_from_url_or_content_type(absolute_src)
-                            if t != "unknown":
-                                add_video(absolute_src, t, {"User-Agent": ua, "Referer": url}, poster=poster, has_audio=True)
-                    except Exception:
-                        pass
+                            try:
+                                # Attempt to click or play the video element programmatically
+                                await frame.evaluate("(elem) => { elem.play().catch(err => {}); }", element)
+                            except Exception:
+                                pass
+                            
+                            try:
+                                src = await element.get_attribute("src")
+                                if src and not src.startswith("blob:"):
+                                    absolute_src = urljoin(url, src)
+                                    t = get_stream_type_from_url_or_content_type(absolute_src)
+                                    if t != "unknown":
+                                        add_video(absolute_src, t, {"User-Agent": ua, "Referer": url}, poster=poster, has_audio=True)
+                            except Exception:
+                                pass
 
-                    try:
-                        sources = await element.query_selector_all("source")
-                        for source in sources:
-                            src_val = await source.get_attribute("src")
-                            if src_val and not src_val.startswith("blob:"):
-                                absolute_src = urljoin(url, src_val)
-                                t = get_stream_type_from_url_or_content_type(absolute_src)
-                                if t != "unknown":
-                                    add_video(absolute_src, t, {"User-Agent": ua, "Referer": url}, poster=poster, has_audio=True)
-                    except Exception:
-                        pass
+                            try:
+                                sources = await element.query_selector_all("source")
+                                for source in sources:
+                                    src_val = await source.get_attribute("src")
+                                    if src_val and not src_val.startswith("blob:"):
+                                        absolute_src = urljoin(url, src_val)
+                                        t = get_stream_type_from_url_or_content_type(absolute_src)
+                                        if t != "unknown":
+                                            add_video(absolute_src, t, {"User-Agent": ua, "Referer": url}, poster=poster, has_audio=True)
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        logger.debug(f"Error extracting from frame: {str(e)}")
                 
                 # Wait for any lazy network requests
                 if wait_time_ms > 0:
