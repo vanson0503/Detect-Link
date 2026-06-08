@@ -43,8 +43,25 @@ def get_stream_type_from_url_or_content_type(url: str, content_type: str = "") -
         return "ts"
     elif ".m4s" in url_lower:
         return "m4s"
+    elif ".mp3" in url_lower or "audio/mpeg" in ct_lower or "audio/mp3" in ct_lower:
+        return "mp3"
+    elif ".m4a" in url_lower or "audio/mp4" in ct_lower:
+        return "m4a"
+    elif ".wav" in url_lower or "audio/wav" in ct_lower:
+        return "wav"
+    elif ".flv" in url_lower or "video/x-flv" in ct_lower:
+        return "flv"
+    elif ".mkv" in url_lower or "video/x-matroska" in ct_lower:
+        return "mkv"
     elif "video/" in ct_lower:
         return "video"
+    elif "audio/" in ct_lower:
+        return "audio"
+    elif "application/octet-stream" in ct_lower:
+        # Many IDM catches happen on octet-stream if it's a media download
+        if any(ext in url_lower for ext in [".mp4", ".mp3", ".mkv", ".flv", ".webm", ".ts", ".m4a"]):
+            return "video" # Generic media
+        return "unknown"
     else:
         return "unknown"
 
@@ -522,7 +539,8 @@ class VideoDetector:
                 try:
                     req_url = request.url
                     stream_type = get_stream_type_from_url_or_content_type(req_url)
-                    if stream_type in ["hls", "dash", "mp4", "ts"]:
+                    valid_types = ["hls", "dash", "mp4", "ts", "video", "audio", "mp3", "m4a", "wav", "flv", "mkv", "webm", "m4s"]
+                    if stream_type in valid_types:
                         add_video(req_url, stream_type, request.headers)
                 except Exception as e:
                     logger.debug(f"Error handling request intercept: {str(e)}")
@@ -536,15 +554,25 @@ class VideoDetector:
                     content_type = headers.get("content-type", "")
                     
                     stream_type = get_stream_type_from_url_or_content_type(req_url, content_type)
-                    if stream_type in ["hls", "dash", "mp4", "ts", "video"]:
+                    
+                    # IDM-like behavior: Catch large octet-streams
+                    content_length = int(headers.get("content-length", "0"))
+                    if stream_type == "unknown" and "application/octet-stream" in content_type:
+                        if content_length > 1024 * 1024: # > 1MB
+                            stream_type = "video"
+                            
+                    valid_types = ["hls", "dash", "mp4", "ts", "video", "audio", "mp3", "m4a", "wav", "flv", "mkv", "webm", "m4s"]
+                    if stream_type in valid_types:
                         actual_type = stream_type
-                        if stream_type == "video":
+                        if stream_type == "video" or stream_type == "audio":
                             if "mpegurl" in content_type.lower():
                                 actual_type = "hls"
                             elif "dash+xml" in content_type.lower():
                                 actual_type = "dash"
-                            else:
+                            elif "mp4" in content_type.lower():
                                 actual_type = "mp4"
+                            elif "mpeg" in content_type.lower():
+                                actual_type = "mp3"
                                 
                         add_video(req_url, actual_type, req.headers)
                     
